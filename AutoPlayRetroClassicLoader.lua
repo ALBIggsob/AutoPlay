@@ -1,14 +1,18 @@
 local Speed = 100
 local ShowLines = true
 local TotalBuildTime = 3
+local AntiStuckEnabled = true
+local OutOfTrackRadius = 5
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local Workspace = game:GetService("Workspace")
+local StarterGui = game:GetService("StarterGui")
 
 local player = Players.LocalPlayer
 local character = player.Character or player.CharacterAdded:Wait()
 local root = character:WaitForChild("HumanoidRootPart")
+local humanoid = character:WaitForChild("Humanoid")
 
 local trackPoints = {
 Vector3.new(40.94, 4.00, 955.39),
@@ -186,67 +190,220 @@ Vector3.new(657.33, 537.68, -361.72),
 Vector3.new(655.12, 538.00, -381.98),
 }
 
+local trackFolder = Instance.new("Folder")
+trackFolder.Name = "TrackLines"
+trackFolder.Parent = Workspace
+
+local rainbowColors = {
+    Color3.fromRGB(255, 0, 0),
+    Color3.fromRGB(255, 127, 0),
+    Color3.fromRGB(255, 255, 0),
+    Color3.fromRGB(0, 255, 0),
+    Color3.fromRGB(0, 0, 255),
+    Color3.fromRGB(75, 0, 130),
+    Color3.fromRGB(148, 0, 211),
+}
+
+local function lerpColor(c1, c2, alpha)
+    return c1:Lerp(c2, alpha)
+end
+
+local isFlying = true
+local antiStuckThread
+local rainbowThread
+local connection
+
+local function cleanupTrack()
+    if trackFolder and trackFolder.Parent then
+        trackFolder:Destroy()
+    end
+end
+
+local function cleanupEverything()
+    isFlying = false
+    if connection then connection:Disconnect() end
+    if rainbowThread then coroutine.close(rainbowThread) end
+    if antiStuckThread then coroutine.close(antiStuckThread) end
+    cleanupTrack()
+end
+
 local function buildLineTrack(points)
     local totalLines = #points - 1
     local delayPerLine = TotalBuildTime / math.max(totalLines, 1)
 
-    for i = 1, totalLines do
-        local fromPos = points[i]
-        local toPos = points[i + 1]
-        local distance = (toPos - fromPos).Magnitude
+    for i = 1, totalLines do      
+        local fromPos = points[i]      
+        local toPos = points[i + 1]      
+        local distance = (toPos - fromPos).Magnitude      
 
-        local part = Instance.new("Part")
-        part.Anchored = true
-        part.CanCollide = false
-        part.Material = Enum.Material.Neon
-        part.Color = Color3.fromRGB(255, 170, 0)
-        part.Size = Vector3.new(0.2, 0.2, distance)
-        part.CFrame = CFrame.new(fromPos, toPos) * CFrame.new(0, 0, -distance / 2)
-        part.Parent = Workspace
-        part.Name = "LineTrackPart"
+        local part = Instance.new("Part")      
+        part.Anchored = true      
+        part.CanCollide = false      
+        part.Material = Enum.Material.Neon      
+        part.Color = rainbowColors[1]      
+        part.Size = Vector3.new(0.2, 0.2, distance)      
+        part.CFrame = CFrame.new(fromPos, toPos) * CFrame.new(0, 0, -distance / 2)      
+        part.Transparency = ShowLines and 0.3 or 1      
+        part.Parent = trackFolder      
 
-        task.wait(delayPerLine)
+        task.wait(delayPerLine)      
     end
 end
 
-local function flyAlongPath(points, speed)
-    root.Anchored = true
-    for i = 1, #points - 1 do
-        local startPos = points[i]
-        local endPos = points[i + 1]
-        local direction = (endPos - startPos).Unit
-        local distance = (endPos - startPos).Magnitude
-        local duration = distance / speed
-        local startTime = tick()
+local function animateRainbow()
+    local parts = trackFolder:GetChildren()
+    local colorCount = #rainbowColors
+    local timePerTransition = 1
 
-        while tick() - startTime < duration do
-            local t = (tick() - startTime) / duration
-            local currentPos = startPos:Lerp(endPos, t)
-            root.CFrame = CFrame.new(currentPos, currentPos + direction)
-            RunService.RenderStepped:Wait()
-        end
-
-        root.CFrame = CFrame.new(endPos, endPos + direction)
-    end
-    root.Anchored = false
-
-    for _, part in ipairs(Workspace:GetChildren()) do
-        if part:IsA("Part") and part.Name == "LineTrackPart" then
-            part:Destroy()
-        end
-    end
-
-    for _, s in ipairs(player:WaitForChild("PlayerScripts"):GetChildren()) do
-        if s:IsA("LocalScript") then
-            s:Destroy()
-        end
-    end
+    rainbowThread = coroutine.create(function()      
+        local t = 0      
+        while isFlying do      
+            t += RunService.Heartbeat:Wait()      
+            for i, part in ipairs(parts) do      
+                if not part:IsDescendantOf(workspace) then continue end      
+                local index1 = ((i + math.floor(t / timePerTransition)) % colorCount) + 1      
+                local index2 = (index1 % colorCount) + 1      
+                local alpha = (t % timePerTransition) / timePerTransition      
+                part.Color = lerpColor(rainbowColors[index1], rainbowColors[index2], alpha)      
+            end      
+        end      
+    end)      
+    coroutine.resume(rainbowThread)
 end
 
-task.spawn(function()
+local function startAntiStuckCheck()
+    if not AntiStuckEnabled then return end
+
+    antiStuckThread = coroutine.create(function()      
+        local lastPosition = root.Position      
+        local stuckTimer = 0      
+        local spamJumpInterval = 0.1      
+
+        while isFlying do      
+            local currentPosition = root.Position      
+            local distance = (currentPosition - lastPosition).Magnitude      
+
+            if distance < 0.5 then      
+                stuckTimer += spamJumpInterval      
+                humanoid:ChangeState(Enum.HumanoidStateType.Jumping)      
+
+                if stuckTimer >= 0.5 then      
+                    local pushDirection = Vector3.new(      
+                        math.random(-1, 1),      
+                        1,      
+                        math.random(-1, 1)      
+                    ).Unit      
+                    root.AssemblyLinearVelocity += pushDirection * 25      
+                end      
+            else      
+                stuckTimer = 0      
+            end      
+
+            lastPosition = currentPosition      
+            task.wait(spamJumpInterval)      
+        end      
+    end)      
+
+    coroutine.resume(antiStuckThread)
+end
+
+local function getClosestPointOnTrack(position)
+    local closestDistance = math.huge
+    local closestPoint = trackPoints[1]
+    local closestIndex = 1
+
+    for i = 1, #trackPoints - 1 do    
+        local a = trackPoints[i]    
+        local b = trackPoints[i + 1]    
+        local ab = b - a    
+        local ap = position - a    
+        local t = math.clamp(ap:Dot(ab.Unit) / ab.Magnitude, 0, 1)    
+        local point = a + ab * t    
+        local dist = (position - point).Magnitude    
+        if dist < closestDistance then    
+            closestDistance = dist    
+            closestPoint = point    
+            closestIndex = i  
+        end    
+    end    
+
+    return closestPoint, closestDistance, closestIndex
+end
+
+local function showNotification(message)
+    pcall(function()
+        StarterGui:SetCore("SendNotification", {
+            Title = "⚠ Warning!",
+            Text = message,
+            Duration = 3
+        })
+    end)
+end
+
+local function flyToPosition(targetPos, targetIndex)
+    local reached = false
+
+    connection = RunService.Heartbeat:Connect(function()  
+        if not root or not root.Parent or not isFlying then  
+            connection:Disconnect()  
+            reached = true  
+            return  
+        end  
+
+        local currentPos = root.Position  
+        local direction = targetPos - currentPos  
+        local distance = direction.Magnitude  
+
+        local closestPoint, distFromTrack, closestIndex = getClosestPointOnTrack(currentPos)  
+
+        if distFromTrack > OutOfTrackRadius then  
+            showNotification("You left the path! Teleporting forward...")  
+            local teleportIndex = math.min(closestIndex + 1, #trackPoints)  
+            local teleportPos = trackPoints[teleportIndex] + Vector3.new(0, 3, 0)  
+            root.CFrame = CFrame.new(teleportPos)  
+            root.AssemblyLinearVelocity = Vector3.zero  
+            task.wait(0.5)  
+            return  
+        end  
+
+        if distance < 2 then  
+            root.AssemblyLinearVelocity = Vector3.zero  
+            connection:Disconnect()  
+            reached = true  
+            return  
+        end  
+
+        local velocity = direction.Unit * Speed  
+        root.AssemblyLinearVelocity = velocity  
+        root.CFrame = CFrame.lookAt(currentPos, targetPos)  
+    end)  
+
+    repeat RunService.Heartbeat:Wait() until reached
+end
+
+local function flyAlongTrack(points)
+    for i = 1, #points do
+        if not isFlying then break end
+        local target = points[i]
+        if i > 1 then
+            local prev = points[i - 1]
+            local deltaY = target.Y - prev.Y
+            if deltaY > 5 then
+                humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+                task.wait(0.2)
+            end
+        end
+        flyToPosition(target, i)
+    end
+    cleanupEverything()
+end
+
+spawn(function()
     if ShowLines then
         buildLineTrack(trackPoints)
+        animateRainbow()
     end
-    task.wait(0.5)
-    flyAlongPath(trackPoints, Speed)
+
+    startAntiStuckCheck()  
+    flyAlongTrack(trackPoints)
 end)
